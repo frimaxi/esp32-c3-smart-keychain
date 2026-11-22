@@ -52,6 +52,7 @@ Seeed XIAO ESP32-C3             1.3" ST7789 IPS (240x240)
 | :--- | :--- | :--- |
 | **TFT VCC** | `3V3` | 3.3V power supply |
 | **TFT GND** | `GND` | Common ground |
+HEAD
 | **TFT SCL** | `D8` (GPIO8) | Hardware SPI Clock |
 | **TFT SDA** | `D10` (GPIO10) | Hardware SPI MOSI |
 | **TFT CS** | `D5` (GPIO7) | Chip Select *(leave unconnected if module has no CS pin)* |
@@ -199,3 +200,6 @@ esp32-c3-smart-keychain/
 ├── .gitignore             # Excludes build artifacts and local source images
 └── README.md              # Project documentation
 ```
+=======
+| **TFT SCL** |
+>>>>>>> 2b32e32 (.)
