@@ -11,9 +11,8 @@
 // ----------------------------------------------------------------------------
 // 1. HARDWARE PINOUT (Seeed Studio XIAO ESP32-C3)
 // ----------------------------------------------------------------------------
-// Note: Using the 3-argument constructor relies on hardware SPI:
+// Note: Passing -1 for CS relies on hardware SPI in SPI_MODE3:
 //       SCL -> D8 (GPIO8) | SDA -> D10 (GPIO10)
-#define TFT_CS   D5
 #define TFT_DC   D4
 #define TFT_RST  D3
 #define TFT_BLK  D2  // Backlight control pin (held LOW during Deep Sleep)
@@ -23,7 +22,6 @@
 // ----------------------------------------------------------------------------
 // 2. COLOR PALETTE (16-bit RGB565 format)
 // ----------------------------------------------------------------------------
-// Customize your UI theme here
 #define NOIR           0x0000  // Black
 #define BLEU_CLAIR     0x96BF  // Light Blue (Primary UI accent)
 #define JAUNE          0xFFE0  // Yellow
@@ -32,12 +30,11 @@
 #define FOND_JAUNE     0xF72F  // Exact background yellow matching the sprite sheet
 #define FOND_Maron     0xF612  // Warm beige/brown accent
 
-Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_ST7789 tft = Adafruit_ST7789(-1, TFT_DC, TFT_RST);
 
 // ----------------------------------------------------------------------------
 // 3. STATE MACHINES & GLOBAL VARIABLES
 // ----------------------------------------------------------------------------
-// Main application screens
 enum Etat {
   ETAT_MENU,
   ETAT_SMILEY,
@@ -45,34 +42,29 @@ enum Etat {
   ETAT_JEU
 };
 
-// Clock sub-states for single-button time adjustment
 enum ModeHorloge {
   AFFICHAGE_HEURE,
   REGLAGE_HEURES,
   REGLAGE_MINUTES
 };
 
-// Dino mini-game sub-states
 enum ModeJeu {
   JEU_PRET,
   JEU_EN_COURS,
   JEU_GAME_OVER
 };
 
-// Forward declaration needed by menu()
 void entrerEnVeilleProfonde();
 
-// Interrupt-shared variables (must be volatile)
-volatile bool boutonAppuye = false;
-volatile unsigned long tempsAppuye = 0;
+bool boutonAppuye = false;
+unsigned long tempsAppuye = 0;
 
-// UI navigation & dirty-flag rendering (prevents SPI screen flicker)
 int selection = 0;
 Etat etatActuel = ETAT_MENU;
 bool majEcran = true;
 
-// 1-bit off-screen buffer in RAM (~7.2 KB) for flicker-free 30 FPS game rendering
-GFXcanvas1 canvas(240, 240);
+// 1-bit off-screen buffer in RAM (240x205 saves SPI bandwidth while covering HUD + ground)
+GFXcanvas1 canvas(240, 205);
 
 // ----------------------------------------------------------------------------
 // 4. DINO GAME CONFIGURATION & STATE
@@ -89,29 +81,50 @@ float vitesseY = 0;
 bool auSol = true;
 float cactusX = 250;
 int cactusH = 28;
-float vitesseJeu = 5.5f;
+float vitesseJeu = 6.5f;
 int score = 0;
 RTC_DATA_ATTR int meilleurScore = 0; // Persists in RTC memory across Deep Sleep cycles
 unsigned long momentGameOver = 0;
 
 // ----------------------------------------------------------------------------
-// 5. BUTTON INTERRUPT SERVICE ROUTINE (ISR)
+// 5. RELIABLE BUTTON POLLING (Debounced short click & instant long press)
 // ----------------------------------------------------------------------------
-// Measures press duration on release and filters out mechanical switch bounce (< 50 ms)
-void IRAM_ATTR gererAppuiBouton() {
-  static unsigned long temps1 = 0;
-  static unsigned long temps2 = 0;
+void lireBouton() {
+  static bool etatPrecedent = HIGH;
+  static unsigned long debutAppui = 0;
+  static bool appuiLongDeclenche = false;
 
-  if (digitalRead(BTN_PIN) == LOW) {
-    temps1 = millis();
-  } else if (digitalRead(BTN_PIN) == HIGH) {
-    temps2 = millis();
-    unsigned long temp = temps2 - temps1;
-    if (temp > 50) { // Software debounce threshold
-      tempsAppuye = temp;
+  // During active gameplay, the button is read directly by the jump physics
+  if (etatActuel == ETAT_JEU && modeJeu == JEU_EN_COURS) {
+    etatPrecedent = digitalRead(BTN_PIN);
+    return;
+  }
+
+  bool etatActuelBtn = digitalRead(BTN_PIN);
+
+  // Button pressed down
+  if (etatPrecedent == HIGH && etatActuelBtn == LOW) {
+    debutAppui = millis();
+    appuiLongDeclenche = false;
+  }
+
+  // Trigger long press immediately once held for 400 ms
+  if (etatActuelBtn == LOW && !appuiLongDeclenche && (millis() - debutAppui >= 400)) {
+    tempsAppuye = 450;
+    boutonAppuye = true;
+    appuiLongDeclenche = true;
+  }
+
+  // Button released: register short click if not already triggered as a long press
+  if (etatPrecedent == LOW && etatActuelBtn == HIGH) {
+    unsigned long duree = millis() - debutAppui;
+    if (!appuiLongDeclenche && duree >= 40 && duree < 400) {
+      tempsAppuye = duree;
       boutonAppuye = true;
     }
   }
+
+  etatPrecedent = etatActuelBtn;
 }
 
 // ----------------------------------------------------------------------------
@@ -120,14 +133,11 @@ void IRAM_ATTR gererAppuiBouton() {
 void menu() {
   const char* options[] = {"Jeu", "Heure", "Smiley", "Eteindre"};
 
-  // Handle button input
   if (boutonAppuye) {
     if (tempsAppuye < 400) {
-      // Short click: cycle through menu options
       selection = (selection + 1) % 4;
       majEcran = true;
     } else {
-      // Long press (>= 400 ms): launch selected mode
       tft.fillScreen(NOIR);
       majEcran = true;
       switch (selection) {
@@ -140,16 +150,13 @@ void menu() {
     boutonAppuye = false;
   }
 
-  // Render UI only when a state or selection change occurred
   if (majEcran && etatActuel == ETAT_MENU) {
-    // Centered header and horizontal divider
     tft.setTextSize(3);
     tft.setTextColor(BLEU_CLAIR, NOIR);
     tft.setCursor(84, 14);
     tft.print("Menu");
     tft.fillRect(20, 44, 200, 3, BLEU_CLAIR);
 
-    // Draw menu items with a rounded highlight pill on the active row
     tft.setTextSize(2);
     for (int i = 0; i < 4; i++) {
       int y = 58 + (i * 44);
@@ -179,7 +186,7 @@ void reinitialiserJeu() {
   auSol = true;
   cactusX = 250;
   cactusH = 28;
-  vitesseJeu = 5.5f;
+  vitesseJeu = 6.5f;
   score = 0;
   boutonAppuye = false;
 }
@@ -190,28 +197,27 @@ void lancejeu() {
   static bool jambeAlternee = false;
   static int compteurPas = 0;
 
-  // Lock frame rate to ~33 FPS (30 ms per frame)
-  if (millis() - derniereFrame < 30) {
+  if (millis() - derniereFrame < 25) {
     return;
   }
   derniereFrame = millis();
 
-  // 1. Zero-latency jump: read raw GPIO state directly instead of waiting for button release
+  // 1. Zero-latency jump
   if (digitalRead(BTN_PIN) == LOW && auSol) {
-    vitesseY = -11.5f; // Initial upward impulse
+    vitesseY = -12.0f;
     auSol = false;
   }
 
-  // 2. Vertical physics (gravity & ground collision)
+  // 2. Vertical physics
   dinoY += vitesseY;
-  vitesseY += 0.85f; // Gravity acceleration
+  vitesseY += 0.90f;
   if (dinoY >= SOL_Y - DINO_H) {
     dinoY = SOL_Y - DINO_H;
     vitesseY = 0;
     auSol = true;
   }
 
-  // 3. Obstacle movement, random respawn & progressive speed scaling
+  // 3. Obstacle movement & speed scaling
   cactusX -= vitesseJeu;
   if (cactusX < -CACTUS_L) {
     cactusX = 240 + random(15, 95);
@@ -220,12 +226,12 @@ void lancejeu() {
     if (score > meilleurScore) {
       meilleurScore = score;
     }
-    if (vitesseJeu < 11.0f) {
-      vitesseJeu += 0.15f; // Gradually increase difficulty
+    if (vitesseJeu < 12.0f) {
+      vitesseJeu += 0.20f;
     }
   }
 
-  // 4. AABB collision detection (with a forgiving 3 px margin for fair gameplay)
+  // 4. AABB collision detection
   int dY = (int)dinoY;
   int cX = (int)cactusX;
   int cY = SOL_Y - cactusH;
@@ -246,7 +252,6 @@ void lancejeu() {
   // 5. Render full scene into the off-screen RAM canvas
   canvas.fillScreen(0);
 
-  // HUD: High Score & Current Score
   canvas.setTextSize(2);
   canvas.setTextColor(1);
   canvas.setCursor(10, 12);
@@ -254,7 +259,6 @@ void lancejeu() {
   canvas.setCursor(155, 12);
   canvas.printf("%03d", score);
 
-  // Scrolling ground line and pebbles
   canvas.drawFastHLine(0, SOL_Y, 240, 1);
   decalageSol = (decalageSol + (int)vitesseJeu) % 40;
   for (int x = -decalageSol; x < 240; x += 40) {
@@ -263,13 +267,12 @@ void lancejeu() {
   }
 
   // Procedural T-Rex sprite
-  canvas.fillRect(DINO_X + 8, dY, 14, 10, 1);       // Head
-  canvas.fillRect(DINO_X + 16, dY + 2, 2, 2, 0);    // Eye
-  canvas.fillRect(DINO_X + 4, dY + 9, 13, 11, 1);   // Torso
-  canvas.fillRect(DINO_X, dY + 11, 4, 6, 1);        // Tail
-  canvas.fillRect(DINO_X + 17, dY + 12, 4, 2, 1);   // Arm
+  canvas.fillRect(DINO_X + 8, dY, 14, 10, 1);
+  canvas.fillRect(DINO_X + 16, dY + 2, 2, 2, 0);
+  canvas.fillRect(DINO_X + 4, dY + 9, 13, 11, 1);
+  canvas.fillRect(DINO_X, dY + 11, 4, 6, 1);
+  canvas.fillRect(DINO_X + 17, dY + 12, 4, 2, 1);
 
-  // Leg animation (tucked while jumping, alternating while running)
   if (!auSol) {
     canvas.fillRect(DINO_X + 6, dY + 20, 4, 6, 1);
     canvas.fillRect(DINO_X + 12, dY + 20, 4, 6, 1);
@@ -295,12 +298,11 @@ void lancejeu() {
   canvas.fillRect(cX + 10, cY + 10, 4, 3, 1);
   canvas.fillRect(cX + 12, cY + 5, 2, 8, 1);
 
-  // 6. Push entire frame buffer to the ST7789 over SPI in a single draw call
-  tft.drawBitmap(0, 0, canvas.getBuffer(), 240, 240, BLEU_CLAIR, NOIR);
+  // 6. Push 240x205 frame buffer to ST7789 over fast SPI
+  tft.drawBitmap(0, 0, canvas.getBuffer(), 240, 205, BLEU_CLAIR, NOIR);
 }
 
 void jeu() {
-  // Sub-state 1: Title screen
   if (modeJeu == JEU_PRET) {
     if (majEcran) {
       tft.fillScreen(NOIR);
@@ -309,7 +311,6 @@ void jeu() {
       tft.setCursor(48, 35);
       tft.print("DINO RUN");
 
-      // Static Dino preview on the ground
       tft.drawFastHLine(0, SOL_Y, 240, BLEU_CLAIR);
       tft.fillRect(DINO_X + 8, SOL_Y - DINO_H, 14, 10, BLEU_CLAIR);
       tft.fillRect(DINO_X + 16, SOL_Y - DINO_H + 2, 2, 2, NOIR);
@@ -341,11 +342,9 @@ void jeu() {
       boutonAppuye = false;
     }
   } 
-  // Sub-state 2: Active gameplay
   else if (modeJeu == JEU_EN_COURS) {
     lancejeu();
   } 
-  // Sub-state 3: Game Over modal
   else if (modeJeu == JEU_GAME_OVER) {
     if (majEcran) {
       tft.fillRect(25, 55, 190, 115, NOIR);
@@ -370,7 +369,6 @@ void jeu() {
     }
 
     if (boutonAppuye) {
-      // 400 ms lockout prevents the player's last jump release from accidentally triggering menu exit
       if (millis() - momentGameOver > 400) {
         if (tempsAppuye >= 400) {
           modeJeu = JEU_PRET;
@@ -396,24 +394,20 @@ void horloge() {
   static int minutesReglage = 0;
   static unsigned long dernierRafraichissement = 0;
 
-  // Read current time from the ESP32 internal RTC
   time_t maintenant;
   time(&maintenant);
   struct tm temps;
   localtime_r(&maintenant, &temps);
 
-  // Handle button inputs across clock modes
   if (boutonAppuye) {
     if (mode == AFFICHAGE_HEURE) {
       if (tempsAppuye >= 400) {
-        // Long press: exit to Main Menu
         etatActuel = ETAT_MENU;
         tft.fillScreen(NOIR);
         majEcran = true;
         boutonAppuye = false;
         return;
       } else {
-        // Short click: enter Hours adjustment mode
         heuresReglage = temps.tm_hour;
         minutesReglage = temps.tm_min;
         mode = REGLAGE_HEURES;
@@ -425,7 +419,6 @@ void horloge() {
         heuresReglage = (heuresReglage + 1) % 24;
         majEcran = true;
       } else {
-        // Long press: confirm hours, move to Minutes adjustment
         mode = REGLAGE_MINUTES;
         majEcran = true;
       }
@@ -434,9 +427,8 @@ void horloge() {
         minutesReglage = (minutesReglage + 1) % 60;
         majEcran = true;
       } else {
-        // Long press: save new time into the system RTC
         struct tm nouveauTemps = {0};
-        nouveauTemps.tm_year = 2026 - 1900; // Valid reference year required by mktime()
+        nouveauTemps.tm_year = 2026 - 1900;
         nouveauTemps.tm_mon  = 0;
         nouveauTemps.tm_mday = 1;
         nouveauTemps.tm_hour = heuresReglage;
@@ -455,12 +447,10 @@ void horloge() {
     boutonAppuye = false;
   }
 
-  // Trigger a screen update once per second in normal clock mode
   if (mode == AFFICHAGE_HEURE && (millis() - dernierRafraichissement >= 1000)) {
     majEcran = true;
   }
 
-  // Render clock UI
   if (majEcran) {
     dernierRafraichissement = millis();
 
@@ -481,7 +471,6 @@ void horloge() {
     tft.setTextSize(4);
     tft.setCursor(60, 95);
 
-    // Highlight hours when active
     if (mode == REGLAGE_HEURES) {
       tft.setTextColor(NOIR, BLANC);
     } else {
@@ -492,7 +481,6 @@ void horloge() {
     tft.setTextColor(BLEU_CLAIR, NOIR);
     tft.print(":");
 
-    // Highlight minutes when active
     if (mode == REGLAGE_MINUTES) {
       tft.setTextColor(NOIR, BLANC);
     } else {
@@ -500,7 +488,6 @@ void horloge() {
     }
     tft.printf("%02d", mAffichage);
 
-    // Seconds counter (hidden during time adjustment)
     tft.setTextSize(2);
     tft.setCursor(108, 140);
     if (mode == AFFICHAGE_HEURE) {
@@ -511,7 +498,6 @@ void horloge() {
       tft.print("  ");
     }
 
-    // Footer control hint
     tft.setTextSize(1);
     tft.setTextColor(BLANC, NOIR);
     tft.setCursor(15, 210);
@@ -528,7 +514,6 @@ void horloge() {
 // ----------------------------------------------------------------------------
 // 9. ANIMATED MASCOT / CHARACTER DISPLAY (PROGMEM RGB565 Bitmaps)
 // ----------------------------------------------------------------------------
-// Centers and draws the selected 160x160 sprite from Flash memory
 void afficherExpression(int index) {
   int posX = (240 - IMG_LARGEUR) / 2;
   int posY = (240 - IMG_HAUTEUR) / 2;
@@ -542,26 +527,22 @@ void dessinerSmiley() {
   static unsigned long dureeMaintien = 3500;
   static int indexAuto = 1;
 
-  // 1. Handle button input
   if (boutonAppuye) {
     if (tempsAppuye >= 400) {
-      // Long press: return to Main Menu and restore black background
       etatActuel = ETAT_MENU;
       tft.fillScreen(NOIR);
       majEcran = true;
       boutonAppuye = false;
       return;
     } else {
-      // Short click: manually cycle through all 9 character expressions
       indexActuel = (indexActuel + 1) % NB_EXPRESSIONS;
       afficherExpression(indexActuel);
       dernierChangement = millis();
-      dureeMaintien = 4000; // Hold user-selected expression for 4 seconds
+      dureeMaintien = 4000;
     }
     boutonAppuye = false;
   }
 
-  // 2. Initial screen draw (fills screen with FOND_JAUNE so 160x160 sprites blend seamlessly)
   if (majEcran) {
     tft.fillScreen(FOND_JAUNE);
     indexActuel = 0;
@@ -571,17 +552,16 @@ void dessinerSmiley() {
     majEcran = false;
   }
 
-  // 3. Idle animation loop (periodically cycles through happy expressions 1..4)
   unsigned long maintenant = millis();
   if (maintenant - dernierChangement >= dureeMaintien) {
     if (indexActuel == 0) {
       indexActuel = indexAuto;
       indexAuto++;
       if (indexAuto > 4) indexAuto = 1;
-      dureeMaintien = 900;  // Show reaction for 0.9 s
+      dureeMaintien = 900;
     } else {
-      indexActuel = 0;      // Return to default expression
-      dureeMaintien = 3500; // Wait 3.5 s before next reaction
+      indexActuel = 0;
+      dureeMaintien = 3500;
     }
     afficherExpression(indexActuel);
     dernierChangement = maintenant;
@@ -592,22 +572,18 @@ void dessinerSmiley() {
 // 10. POWER MANAGEMENT (DEEP SLEEP)
 // ----------------------------------------------------------------------------
 void entrerEnVeilleProfonde() {
-  // Cut display backlight and lock GPIO state LOW during Deep Sleep
   digitalWrite(TFT_BLK, LOW);
   gpio_hold_en((gpio_num_t)TFT_BLK);
   gpio_deep_sleep_hold_en();
 
-  // Put ST7789 display controller into low-power sleep mode
   tft.enableDisplay(false);
   tft.enableSleep(true);
 
-  // Wait for the user to release D0 so the device doesn't immediately wake back up
   while (digitalRead(BTN_PIN) == LOW) {
     delay(10);
   }
   delay(50);
 
-  // Arm GPIO wake-up on D0 (active LOW) and enter Deep Sleep
   esp_deep_sleep_enable_gpio_wakeup(1ULL << D0, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
 }
@@ -618,44 +594,39 @@ void entrerEnVeilleProfonde() {
 void setup() {
   Serial.begin(115200);
 
-  // Disable Wi-Fi and Bluetooth radios to maximize LiPo battery life
   WiFi.mode(WIFI_OFF);
   btStop();
 
-  // Release backlight pin hold upon waking from Deep Sleep
   gpio_hold_dis((gpio_num_t)TFT_BLK);
   pinMode(TFT_BLK, OUTPUT);
   digitalWrite(TFT_BLK, LOW);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
 
-  // Initialize 1.3" ST7789 IPS display (240x240)
+  // Initialize 1.3" ST7789 IPS display (240x240) at 40 MHz SPI
   tft.init(240, 240, SPI_MODE3);
+  tft.setSPISpeed(40000000);
   tft.setRotation(2);
 
-  // On cold boot (e.g., plugging in the battery), enter Deep Sleep immediately
-  // until the user wakes the keychain by pressing D0
   if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO) {
     entrerEnVeilleProfonde();
   }
 
-  // Wait for the wake-up button press to be released before attaching the ISR
   while (digitalRead(BTN_PIN) == LOW) {
     delay(10);
   }
   delay(50);
 
   boutonAppuye = false;
-  attachInterrupt(digitalPinToInterrupt(BTN_PIN), gererAppuiBouton, CHANGE);
 
-  // Pre-draw the menu before turning on the backlight to avoid a white flash
   tft.fillScreen(NOIR);
   menu();
   digitalWrite(TFT_BLK, HIGH);
 }
 
 void loop() {
-  // Non-blocking state router
+  lireBouton();
+
   switch (etatActuel) {
     case ETAT_MENU:
       menu();
